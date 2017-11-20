@@ -46,8 +46,6 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/cpufreq_interactive.h>
 
-extern bool screen_on;
-
 struct cpufreq_interactive_cpuinfo {
 	struct timer_list cpu_timer;
 	struct timer_list cpu_slack_timer;
@@ -56,15 +54,14 @@ struct cpufreq_interactive_cpuinfo {
 	u64 time_in_idle_timestamp;
 	u64 cputime_speedadj;
 	u64 cputime_speedadj_timestamp;
-	u64 last_evaluated_jiffy;
 	struct cpufreq_policy *policy;
 	struct cpufreq_frequency_table *freq_table;
 	spinlock_t target_freq_lock; /*protects target freq */
 	unsigned int target_freq;
 	unsigned int floor_freq;
+	unsigned int max_freq;
 	u64 floor_validate_time;
 	u64 hispeed_validate_time;
-	u64 max_freq_idle_start_time;
 	struct rw_semaphore enable_sem;
 	int governor_enabled;
 #ifdef CONFIG_PMU_COREMEM_RATIO
@@ -88,7 +85,6 @@ static spinlock_t regionchange_cpumask_lock;
 static unsigned int default_target_loads[] = {DEFAULT_TARGET_LOAD};
 
 #define DEFAULT_TIMER_RATE (20 * USEC_PER_MSEC)
-#define SCREEN_OFF_TIMER_RATE ((unsigned long)(50 * USEC_PER_MSEC))
 #define DEFAULT_ABOVE_HISPEED_DELAY DEFAULT_TIMER_RATE
 static unsigned int default_above_hispeed_delay[] = {
 	DEFAULT_ABOVE_HISPEED_DELAY };
@@ -155,7 +151,6 @@ struct cpufreq_interactive_tunables {
 	 * The sample rate of the timer used to increase frequency
 	 */
 	unsigned long timer_rate;
-	unsigned long prev_timer_rate;
 	/*
 	 * Wait this long before raising speed above hispeed, by default a
 	 * single timer interval.
@@ -232,11 +227,6 @@ struct cpufreq_interactive_tunables {
 
 	unsigned int sampling_down_factor;
 #endif
-	/*
-	 * Stay at max freq for at least max_freq_hysteresis before dropping
-	 * frequency.
-	 */
-	unsigned int max_freq_hysteresis;
 };
 
 /* For cases where we have single governor instance for system */
@@ -244,17 +234,6 @@ static struct cpufreq_interactive_tunables *common_tunables;
 static struct cpufreq_interactive_tunables *tuned_parameters[NR_CPUS] = {NULL, };
 
 static struct attribute_group *get_sysfs_attr(void);
-
-/* Round to starting jiffy of next evaluation window */
-static u64 round_to_nw_start(u64 jif,
-			     struct cpufreq_interactive_tunables *tunables)
-{
-	unsigned long step = usecs_to_jiffies(tunables->timer_rate);
-
-	do_div(jif, step);
-	return (jif + 1) * step;
-}
-
 
 static inline cputime64_t get_cpu_idle_time_jiffy(unsigned int cpu,
 						  cputime64_t *wall)
@@ -299,7 +278,7 @@ static void cpufreq_interactive_timer_resched(
 {
 	struct cpufreq_interactive_tunables *tunables =
 		pcpu->policy->governor_data;
-	u64 expires;
+	unsigned long expires;
 	unsigned long flags;
 
 #ifdef CONFIG_PMU_COREMEM_RATIO
@@ -316,7 +295,7 @@ static void cpufreq_interactive_timer_resched(
 				  tunables->io_is_busy);
 	pcpu->cputime_speedadj = 0;
 	pcpu->cputime_speedadj_timestamp = pcpu->time_in_idle_timestamp;
-	expires = round_to_nw_start(pcpu->last_evaluated_jiffy, tunables);
+	expires = jiffies + usecs_to_jiffies(tunables->timer_rate);
 	mod_timer_pinned(&pcpu->cpu_timer, expires);
 
 	if (tunables->timer_slack_val >= 0 &&
@@ -336,7 +315,8 @@ static void cpufreq_interactive_timer_start(
 	struct cpufreq_interactive_tunables *tunables, int cpu)
 {
 	struct cpufreq_interactive_cpuinfo *pcpu = &per_cpu(cpuinfo, cpu);
-	u64 expires = round_to_nw_start(pcpu->last_evaluated_jiffy, tunables);
+	unsigned long expires = jiffies +
+		usecs_to_jiffies(tunables->timer_rate);
 	unsigned long flags;
 
 #ifdef CONFIG_PMU_COREMEM_RATIO
@@ -705,9 +685,7 @@ static void cpufreq_interactive_timer(unsigned long data)
 	now = update_load(data);
 	delta_time = (unsigned int)(now - pcpu->cputime_speedadj_timestamp);
 	cputime_speedadj = pcpu->cputime_speedadj;
-	pcpu->last_evaluated_jiffy = get_jiffies_64();
 	spin_unlock_irqrestore(&pcpu->load_lock, flags);
-
 
 	if (WARN_ON_ONCE(!delta_time))
 		goto rearm;
@@ -750,16 +728,6 @@ static void cpufreq_interactive_timer(unsigned long data)
 		wake_up_process(tunables->regionchange_task);
 	}
 #endif
-	if (screen_on
-		&& tunables->timer_rate != tunables->prev_timer_rate)
-		tunables->timer_rate = tunables->prev_timer_rate;
-	else if (!screen_on
-		&& tunables->timer_rate != SCREEN_OFF_TIMER_RATE) {
- 		tunables->prev_timer_rate = tunables->timer_rate;
-		tunables->timer_rate
-			= max(tunables->timer_rate,
-				SCREEN_OFF_TIMER_RATE);
-	}
 
 	if (cpu_load >= tunables->go_hispeed_load || boosted) {
 		if (pcpu->target_freq < tunables->hispeed_freq) {
@@ -798,16 +766,6 @@ static void cpufreq_interactive_timer(unsigned long data)
 	}
 
 	new_freq = pcpu->freq_table[index].frequency;
-
-	if (pcpu->target_freq >= pcpu->policy->max
-	    && new_freq < pcpu->target_freq
-	    && now - pcpu->max_freq_idle_start_time <
-	    tunables->max_freq_hysteresis) {
-		trace_cpufreq_interactive_notyet(data, cpu_load,
-			pcpu->target_freq, pcpu->policy->cur, new_freq);
-		spin_unlock_irqrestore(&pcpu->target_freq_lock, flags);
-		goto rearm;
-	}
 
 	/*
 	 * Do not scale below floor_freq unless we have been at or above the
@@ -882,9 +840,6 @@ static void cpufreq_interactive_idle_start(void)
 	struct cpufreq_interactive_cpuinfo *pcpu =
 		&per_cpu(cpuinfo, smp_processor_id());
 	int pending;
-	struct cpufreq_interactive_tunables *tunables;
-	unsigned long flags;
-	u64 now;
 
 	if (!down_read_trylock(&pcpu->enable_sem))
 		return;
@@ -904,25 +859,10 @@ static void cpufreq_interactive_idle_start(void)
 		 * min indefinitely.  This should probably be a quirk of
 		 * the CPUFreq driver.
 		 */
-		if (!pending) {
+		if (!pending)
 			cpufreq_interactive_timer_resched(pcpu);
-
-			/*
-			 * If timer is cancelled because CPU is running at
-			 * policy->max, record the time CPU first goes to
-			 * idle.
-			 */
-			now = ktime_to_us(ktime_get());
-			tunables = pcpu->policy->governor_data;
-			if (tunables->max_freq_hysteresis) {
-				spin_lock_irqsave(&pcpu->target_freq_lock,
-						  flags);
-				pcpu->max_freq_idle_start_time = now;
-				spin_unlock_irqrestore(&pcpu->target_freq_lock,
-						       flags);
-			}
-		}
 	}
+
 	up_read(&pcpu->enable_sem);
 }
 
@@ -1409,27 +1349,6 @@ static ssize_t store_hispeed_freq(struct cpufreq_interactive_tunables *tunables,
 	return count;
 }
 
-#define show_store_one(file_name)					\
-static ssize_t show_##file_name(					\
-	struct cpufreq_interactive_tunables *tunables, char *buf)	\
-{									\
-	return snprintf(buf, PAGE_SIZE, "%u\n", tunables->file_name);	\
-}									\
-static ssize_t store_##file_name(					\
-		struct cpufreq_interactive_tunables *tunables,		\
-		const char *buf, size_t count)				\
-{									\
-	int ret;							\
-	long unsigned int val;						\
-									\
-	ret = kstrtoul(buf, 0, &val);				\
-	if (ret < 0)							\
-		return ret;						\
-	tunables->file_name = val;					\
-	return count;							\
-}
-show_store_one(max_freq_hysteresis);
-
 static ssize_t show_go_hispeed_load(struct cpufreq_interactive_tunables
 		*tunables, char *buf)
 {
@@ -1520,10 +1439,8 @@ static ssize_t store_timer_rate(struct cpufreq_interactive_tunables *tunables,
 #ifdef CONFIG_MODE_AUTO_CHANGE
 	spin_lock_irqsave(&tunables->param_index_lock, flags_idx);
 	tunables->timer_rate_set[tunables->param_index] = val;
-	if (tunables->cur_param_index == tunables->param_index) {
+	if (tunables->cur_param_index == tunables->param_index)
 		tunables->timer_rate = val;
-		tunables->prev_timer_rate = val;
-}
 	spin_unlock_irqrestore(&tunables->param_index_lock, flags_idx);
 #else
 	tunables->timer_rate = val;
@@ -1998,7 +1915,6 @@ show_store_gov_pol_sys(boost);
 store_gov_pol_sys(boostpulse);
 show_store_gov_pol_sys(boostpulse_duration);
 show_store_gov_pol_sys(io_is_busy);
-show_store_gov_pol_sys(max_freq_hysteresis);
 
 #ifdef CONFIG_MODE_AUTO_CHANGE
 show_store_gov_pol_sys(mode);
@@ -2056,7 +1972,6 @@ gov_sys_pol_attr_rw(single_exit_time);
 gov_sys_pol_attr_rw(single_cluster0_min_freq);
 gov_sys_pol_attr_rw(multi_cluster0_min_freq);
 #endif
-gov_sys_pol_attr_rw(max_freq_hysteresis);
 
 static struct global_attr boostpulse_gov_sys =
 	__ATTR(boostpulse, 0200, NULL, store_boostpulse_gov_sys);
@@ -2110,7 +2025,6 @@ static struct attribute *interactive_attributes_gov_sys[] = {
 #ifdef CONFIG_PMU_COREMEM_RATIO
 	&region_time_in_state_gov_sys.attr,
 #endif
-	&max_freq_hysteresis_gov_sys.attr,
 	NULL,
 };
 
@@ -2151,7 +2065,6 @@ static struct attribute *interactive_attributes_gov_pol[] = {
 #ifdef CONFIG_PMU_COREMEM_RATIO
 	&region_time_in_state_gov_pol.attr,
 #endif
-	&max_freq_hysteresis_gov_pol.attr,
 	NULL,
 };
 
@@ -2309,7 +2222,6 @@ static int cpufreq_governor_interactive(struct cpufreq_policy *policy,
 			tunables->ntarget_loads = ARRAY_SIZE(default_target_loads);
 			tunables->min_sample_time = DEFAULT_MIN_SAMPLE_TIME;
 			tunables->timer_rate = DEFAULT_TIMER_RATE;
-			tunables->prev_timer_rate = DEFAULT_TIMER_RATE;
 			tunables->boostpulse_duration_val = DEFAULT_MIN_SAMPLE_TIME;
 			tunables->timer_slack_val = DEFAULT_TIMER_SLACK;
 #ifdef CONFIG_MODE_AUTO_CHANGE
@@ -2420,10 +2332,10 @@ static int cpufreq_governor_interactive(struct cpufreq_policy *policy,
 				ktime_to_us(ktime_get());
 			pcpu->hispeed_validate_time =
 				pcpu->floor_validate_time;
+			pcpu->max_freq = policy->max;
 			down_write(&pcpu->enable_sem);
 			del_timer_sync(&pcpu->cpu_timer);
 			del_timer_sync(&pcpu->cpu_slack_timer);
-			pcpu->last_evaluated_jiffy = get_jiffies_64();
 			cpufreq_interactive_timer_start(tunables, j);
 			pcpu->governor_enabled = 1;
 			up_write(&pcpu->enable_sem);
@@ -2524,8 +2436,24 @@ static int cpufreq_governor_interactive(struct cpufreq_policy *policy,
 
 			spin_unlock_irqrestore(&pcpu->target_freq_lock, flags);
 			up_read(&pcpu->enable_sem);
-		}
 
+			/* Reschedule timer only if policy->max is raised.
+			 * Delete the timers, else the timer callback may
+			 * return without re-arm the timer when failed
+			 * acquire the semaphore. This race may cause timer
+			 * stopped unexpectedly.
+			 */
+
+			if (policy->max > pcpu->max_freq) {
+				down_write(&pcpu->enable_sem);
+				del_timer_sync(&pcpu->cpu_timer);
+				del_timer_sync(&pcpu->cpu_slack_timer);
+				cpufreq_interactive_timer_start(tunables, j);
+				up_write(&pcpu->enable_sem);
+			}
+
+			pcpu->max_freq = policy->max;
+		}
 		break;
 	}
 	return 0;
@@ -2765,7 +2693,6 @@ static int __init cpufreq_interactive_init(void)
 	unsigned int i;
 	struct cpufreq_interactive_cpuinfo *pcpu;
 
-	screen_on = true;
 	/* Initalize per-cpu timers */
 	for_each_possible_cpu(i) {
 		pcpu = &per_cpu(cpuinfo, i);
