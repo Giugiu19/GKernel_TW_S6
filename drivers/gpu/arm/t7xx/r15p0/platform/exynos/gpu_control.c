@@ -40,7 +40,7 @@
 #include "gpu_control.h"
 
 unsigned int gpu_min_override = 100;
-unsigned int gpu_max_override = 852;
+unsigned int gpu_max_override = 772;
 
 static struct gpu_control_ops *ctr_ops;
 
